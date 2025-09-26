@@ -20,7 +20,6 @@ from mem0.configs.prompts import (
     PROCEDURAL_MEMORY_SYSTEM_PROMPT,
     get_update_memory_messages,
 )
-from mem0.exceptions import ValidationError as Mem0ValidationError
 from mem0.memory.base import MemoryBase
 from mem0.memory.setup import mem0_dir, setup_config
 from mem0.memory.storage import SQLiteManager
@@ -39,9 +38,6 @@ from mem0.utils.factory import (
     VectorStoreFactory,
 )
 
-# Suppress SWIG deprecation warnings globally
-warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*SwigPy.*")
-warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*swigvarlink.*")
 
 def _build_filters_and_metadata(
     *,  # Enforce keyword-only arguments
@@ -109,12 +105,7 @@ def _build_filters_and_metadata(
         session_ids_provided.append("run_id")
 
     if not session_ids_provided:
-        raise Mem0ValidationError(
-            message="At least one of 'user_id', 'agent_id', or 'run_id' must be provided.",
-            error_code="VALIDATION_001",
-            details={"provided_ids": {"user_id": user_id, "agent_id": agent_id, "run_id": run_id}},
-            suggestion="Please provide at least one identifier to scope the memory operation."
-        )
+        raise ValueError("At least one of 'user_id', 'agent_id', or 'run_id' must be provided.")
 
     # ---------- optional actor filter ----------
     resolved_actor_id = actor_id or effective_query_filters.get("actor_id")
@@ -232,14 +223,6 @@ class Memory(MemoryBase):
                   including a list of memory items affected (added, updated) under a "results" key,
                   and potentially "relations" if graph store is enabled.
                   Example for v1.1+: `{"results": [{"id": "...", "memory": "...", "event": "ADD"}]}`
-
-        Raises:
-            Mem0ValidationError: If input validation fails (invalid memory_type, messages format, etc.).
-            VectorStoreError: If vector store operations fail.
-            GraphStoreError: If graph store operations fail.
-            EmbeddingError: If embedding generation fails.
-            LLMError: If LLM operations fail.
-            DatabaseError: If database operations fail.
         """
 
         processed_metadata, effective_filters = _build_filters_and_metadata(
@@ -250,11 +233,8 @@ class Memory(MemoryBase):
         )
 
         if memory_type is not None and memory_type != MemoryType.PROCEDURAL.value:
-            raise Mem0ValidationError(
-                message=f"Invalid 'memory_type'. Please pass {MemoryType.PROCEDURAL.value} to create procedural memories.",
-                error_code="VALIDATION_002",
-                details={"provided_type": memory_type, "valid_type": MemoryType.PROCEDURAL.value},
-                suggestion=f"Use '{MemoryType.PROCEDURAL.value}' to create procedural memories."
+            raise ValueError(
+                f"Invalid 'memory_type'. Please pass {MemoryType.PROCEDURAL.value} to create procedural memories."
             )
 
         if isinstance(messages, str):
@@ -264,12 +244,7 @@ class Memory(MemoryBase):
             messages = [messages]
 
         elif not isinstance(messages, list):
-            raise Mem0ValidationError(
-                message="messages must be str, dict, or list[dict]",
-                error_code="VALIDATION_003",
-                details={"provided_type": type(messages).__name__, "valid_types": ["str", "dict", "list[dict]"]},
-                suggestion="Convert your input to a string, dictionary, or list of dictionaries."
-            )
+            raise ValueError("messages must be str, dict, or list[dict]")
 
         if agent_id is not None and memory_type == MemoryType.PROCEDURAL.value:
             results = self._create_procedural_memory(messages, metadata=processed_metadata, prompt=prompt)
@@ -411,12 +386,8 @@ class Memory(MemoryBase):
                 response = ""
 
             try:
-                if not response or not response.strip():
-                    logger.warning("Empty response from LLM, no memories to extract")
-                    new_memories_with_actions = {}
-                else:
-                    response = remove_code_blocks(response)
-                    new_memories_with_actions = json.loads(response)
+                response = remove_code_blocks(response)
+                new_memories_with_actions = json.loads(response)
             except Exception as e:
                 logger.error(f"Invalid JSON response: {e}")
                 new_memories_with_actions = {}
@@ -812,11 +783,9 @@ class Memory(MemoryBase):
 
         keys, encoded_ids = process_telemetry_filters(filters)
         capture_event("mem0.delete_all", self, {"keys": keys, "encoded_ids": encoded_ids, "sync_type": "sync"})
-        # delete all vector memories and reset the collections
         memories = self.vector_store.list(filters=filters)[0]
         for memory in memories:
             self._delete_memory(memory.id)
-        self.vector_store.reset()
 
         logger.info(f"Deleted {len(memories)} memories")
 
@@ -1113,12 +1082,7 @@ class AsyncMemory(MemoryBase):
             messages = [messages]
 
         elif not isinstance(messages, list):
-            raise Mem0ValidationError(
-                message="messages must be str, dict, or list[dict]",
-                error_code="VALIDATION_003",
-                details={"provided_type": type(messages).__name__, "valid_types": ["str", "dict", "list[dict]"]},
-                suggestion="Convert your input to a string, dictionary, or list of dictionaries."
-            )
+            raise ValueError("messages must be str, dict, or list[dict]")
 
         if agent_id is not None and memory_type == MemoryType.PROCEDURAL.value:
             results = await self._create_procedural_memory(
@@ -1213,7 +1177,7 @@ class AsyncMemory(MemoryBase):
         )
         try:
             response = remove_code_blocks(response)
-            new_retrieved_facts = json.loads(response)["facts"]
+            new_retrieved_facts = json.loads(response).get("facts", [])
         except Exception as e:
             logger.error(f"Error in new_retrieved_facts: {e}")
             new_retrieved_facts = []
@@ -1224,7 +1188,8 @@ class AsyncMemory(MemoryBase):
         retrieved_old_memory = []
         new_message_embeddings = {}
 
-        async def process_fact_for_search(new_mem_content):
+        async def process_fact_for_search(new_mem):
+            new_mem_content = new_mem["text"]
             embeddings = await asyncio.to_thread(self.embedding_model.embed, new_mem_content, "add")
             new_message_embeddings[new_mem_content] = embeddings
             existing_mems = await asyncio.to_thread(
@@ -1232,9 +1197,9 @@ class AsyncMemory(MemoryBase):
                 query=new_mem_content,
                 vectors=embeddings,
                 limit=5,
-                filters=effective_filters,  # 'filters' is query_filters_for_inference
+                filters=effective_filters,
             )
-            return [{"id": mem.id, "text": mem.payload["data"]} for mem in existing_mems]
+            return [{"id": mem.id, "text": mem.payload["data"], "categories": new_mem["categories"]} for mem in existing_mems]
 
         search_tasks = [process_fact_for_search(fact) for fact in new_retrieved_facts]
         search_results_list = await asyncio.gather(*search_tasks)
@@ -1265,12 +1230,8 @@ class AsyncMemory(MemoryBase):
                 logger.error(f"Error in new memory actions response: {e}")
                 response = ""
             try:
-                if not response or not response.strip():
-                    logger.warning("Empty response from LLM, no memories to extract")
-                    new_memories_with_actions = {}
-                else:
-                    response = remove_code_blocks(response)
-                    new_memories_with_actions = json.loads(response)
+                response = remove_code_blocks(response)
+                new_memories_with_actions = json.loads(response)
             except Exception as e:
                 logger.error(f"Invalid JSON response: {e}")
                 new_memories_with_actions = {}
@@ -1287,7 +1248,9 @@ class AsyncMemory(MemoryBase):
                     if not action_text:
                         continue
                     event_type = resp.get("event")
-
+                    if new_categories := resp.get("categories"):
+                        if isinstance(new_categories, str): new_categories = [new_categories]
+                        metadata["categories"] = metadata.get("categories", []) + new_categories
                     if event_type == "ADD":
                         task = asyncio.create_task(
                             self._create_memory(
@@ -1319,18 +1282,19 @@ class AsyncMemory(MemoryBase):
                 try:
                     result_id = await task
                     if event_type == "ADD":
-                        returned_memories.append({"id": result_id, "memory": resp.get("text"), "event": event_type})
+                        returned_memories.append({"id": result_id, "memory": resp.get("text"), "metadate": metadata, "event": event_type})
                     elif event_type == "UPDATE":
                         returned_memories.append(
                             {
                                 "id": mem_id,
                                 "memory": resp.get("text"),
+                                "metadate": metadata,
                                 "event": event_type,
                                 "previous_memory": resp.get("old_memory"),
                             }
                         )
                     elif event_type == "DELETE":
-                        returned_memories.append({"id": mem_id, "memory": resp.get("text"), "event": event_type})
+                        returned_memories.append({"id": mem_id, "memory": resp.get("text"), "metadate": metadata, "event": event_type})
                 except Exception as e:
                     logger.error(f"Error awaiting memory task (async): {e}")
         except Exception as e:
