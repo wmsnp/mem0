@@ -1070,6 +1070,8 @@ class AsyncMemory(MemoryBase):
             user_id=user_id, agent_id=agent_id, run_id=run_id, input_metadata=metadata
         )
 
+        effective_filters.pop("run_id", None)
+
         if memory_type is not None and memory_type != MemoryType.PROCEDURAL.value:
             raise ValueError(
                 f"Invalid 'memory_type'. Please pass {MemoryType.PROCEDURAL.value} to create procedural memories."
@@ -1709,7 +1711,6 @@ class AsyncMemory(MemoryBase):
             actor_id=metadata.get("actor_id"),
             role=metadata.get("role"),
         )
-
         capture_event("mem0._create_memory", self, {"memory_id": memory_id, "sync_type": "async"})
         return memory_id
 
